@@ -9,14 +9,25 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/config/store).data.ownerUid == request.auth.uid;
     }
     function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function validStoreSettings(data) {
+      return (!('shippingFee' in data) || (data.shippingFee is number && data.shippingFee >= 0 && data.shippingFee <= 2000))
+        && (!('freeShippingMinimum' in data) || (data.freeShippingMinimum is number && data.freeShippingMinimum >= 0 && data.freeShippingMinimum <= 100000))
+        && (!('contactEmail' in data) || (data.contactEmail is string && data.contactEmail.size() <= 120))
+        && (!('contactPhone' in data) || (data.contactPhone is string && data.contactPhone.size() <= 20));
+    }
 
     // Who owns the store. Created once by the first account (or by hand in the console).
     match /config/store {
       allow read: if true;
       allow create: if signedIn() && !storeHasOwner()
         && request.resource.data.ownerUid == request.auth.uid
-        && request.resource.data.keys().hasOnly(['ownerUid', 'at']);
-      allow update, delete: if false;
+        && request.resource.data.keys().hasOnly(['ownerUid', 'at', 'shippingFee', 'freeShippingMinimum', 'contactEmail', 'contactPhone'])
+        && validStoreSettings(request.resource.data);
+      allow update: if isOwner()
+        && changed().hasOnly(['shippingFee', 'freeShippingMinimum', 'contactEmail', 'contactPhone'])
+        && request.resource.data.ownerUid == resource.data.ownerUid
+        && validStoreSettings(request.resource.data);
+      allow delete: if false;
     }
 
     // Each shopper's own profile and saved addresses.
@@ -47,8 +58,25 @@ service cloud.firestore {
       // One review per signed-in user (the document id is the user id).
       match /reviews/{uid} {
         allow read: if true;
+        function hasDeliveredPurchase() {
+          let review = request.resource.data;
+          let orderPath = /databases/$(database)/documents/orders/$(review.orderId);
+          return review.orderId is string
+            && review.orderItem is map
+            && review.orderItem.pid == get(/databases/$(database)/documents/products/$(pid)).data.id
+            && exists(orderPath)
+            && get(orderPath).data.uid == request.auth.uid
+            && (get(orderPath).data.status == 'Delivered'
+              || get(orderPath).data.status == 'Return'
+              || get(orderPath).data.status == 'Return accepted'
+              || get(orderPath).data.status == 'Return processed'
+              || get(orderPath).data.status == 'Refund initiated')
+            && get(orderPath).data.items.hasAny([review.orderItem]);
+        }
         allow create: if signedIn() && request.auth.uid == uid
           && request.resource.data.uid == uid
+          && request.resource.data.verified == true
+          && hasDeliveredPurchase()
           && request.resource.data.rating is number
           && request.resource.data.rating >= 1 && request.resource.data.rating <= 5
           && request.resource.data.text is string && request.resource.data.text.size() <= 600
@@ -79,8 +107,52 @@ service cloud.firestore {
         || (signedIn() && resource.data.uid == request.auth.uid
             && (resource.data.status == 'Placed' || resource.data.status == 'Confirmed')
             && changed().hasOnly(['cancelRequested'])
-            && request.resource.data.cancelRequested == true);
+            && request.resource.data.cancelRequested == true)
+        || (signedIn() && resource.data.uid == request.auth.uid
+            && resource.data.status == 'Delivered'
+            && resource.data.deliveredAt is timestamp
+            && request.time < resource.data.deliveredAt + duration.value(7, 'd')
+            && changed().hasOnly(['returnRequested', 'returnRequestedAt'])
+            && (!('returnRequested' in resource.data) || resource.data.returnRequested != true)
+            && request.resource.data.returnRequested == true
+            && request.resource.data.returnRequestedAt == request.time);
       allow delete: if false;
+    }
+
+    // Firebase Trigger Email extension reads new documents from this collection.
+    // Delivery metadata is written by the extension's privileged service account.
+    match /mail/{mailId} {
+      allow read, update, delete: if false;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['to', 'message', 'orderId', 'event', 'at'])
+        && request.resource.data.to is string
+        && request.resource.data.message is map
+        && request.resource.data.message.keys().hasOnly(['subject', 'text'])
+        && request.resource.data.message.subject is string
+        && request.resource.data.message.text is string
+        && request.resource.data.orderId is string
+        && request.resource.data.at is number
+        && (
+          (request.resource.data.event == 'placed'
+            && request.auth.token.email == request.resource.data.to
+            && !exists(/databases/$(database)/documents/orders/$(request.resource.data.orderId))
+            && existsAfter(/databases/$(database)/documents/orders/$(request.resource.data.orderId))
+            && getAfter(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.uid == request.auth.uid
+            && getAfter(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.email == request.resource.data.to
+            && getAfter(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.status == 'Placed')
+          || (isOwner()
+            && exists(/databases/$(database)/documents/orders/$(request.resource.data.orderId))
+            && existsAfter(/databases/$(database)/documents/orders/$(request.resource.data.orderId))
+            && get(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.email == request.resource.data.to
+            && (
+              (request.resource.data.event == 'confirmed'
+                && getAfter(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.status == 'Confirmed'
+                && get(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.status != 'Confirmed')
+              || (request.resource.data.event == 'delivered'
+                && getAfter(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.status == 'Delivered'
+                && get(/databases/$(database)/documents/orders/$(request.resource.data.orderId)).data.status != 'Delivered')
+            ))
+        );
     }
   }
 }

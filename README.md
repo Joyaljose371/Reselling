@@ -28,7 +28,8 @@ npx serve public
    firebase use --add          # pick your project
    firebase deploy --only firestore:rules,hosting
    ```
-6. **Open the site and create your own account first.** On a fresh store the first account becomes the owner and the **Seller panel** button appears in the header. Then use Seller panel > Overview > **Load sample products** to see the store working, and **Remove sample products** when you are ready to list your own.
+6. **Install the Trigger Email extension** from Firebase Extensions. Configure its watched collection as `mail` and configure Gmail SMTP with a Gmail App Password (requires 2-Step Verification; never put the password in this repository). The extension needs a billing-enabled Firebase project. The app queues email for order placed, confirmed and delivered.
+7. **Open the site and create your own account first.** On a fresh store the first account becomes the owner and the **Seller panel** button appears in the header. Then use Seller panel > Overview > **Load sample products** to see the store working, and **Remove sample products** when you are ready to list your own.
 
 The sample catalog is stationery-themed. Changing the site files does not change products already saved in Firestore; remove old sample products from Seller panel > Overview, or edit/delete old listings in Seller panel > Products, then add your stationery inventory.
 
@@ -47,9 +48,18 @@ To set the owner by hand instead: set `claimOwnerOnFirstSignup = false`, create 
 | `coupons` | codes and rules | owner |
 | `orders` | items, address, totals, status | shopper creates; owner updates status; shopper can only request a cancellation |
 | `users/{uid}` | name, phone, verified addresses | that shopper |
-| `config/store` | `ownerUid` | created once |
+| `config/store` | owner UID, shipping settings, customer support contacts | owner settings |
+| `mail` | transactional email requests for the Trigger Email extension | order owner/customer via constrained rules; extension processes delivery |
 
 Cart and wishlist stay in each shopper's browser.
+
+## Delivery, returns, and customer emails
+
+- In Seller panel > Overview, set one delivery charge per order, a free-delivery order minimum (set to `0` to disable the minimum), and customer-facing support email/WhatsApp details. Free delivery applies if the cart reaches the minimum, every item in the cart is marked **Free delivery**, or a free-shipping coupon applies.
+- Choose **This product qualifies for free delivery** while adding or editing an item. In a mixed cart, every item must have this flag for product-based free delivery to apply.
+- A customer can request a return within 7 days of an order being marked Delivered. After the request, the seller advances the order through **Return accepted**, **Return processed**, and **Refund initiated**, in that order; the customer sees these milestones in order tracking. “Refund initiated” records the seller's action but does not issue a payment automatically. For older delivered orders without a delivery timestamp, use **Record delivery date** on the seller order card; this starts the seven-day return window from when it is recorded.
+- PIN lookups use the `api.postalpincode.in` directory to show matching post offices, district and state. The customer selects the matching locality. This identifies postal delivery areas, not a house or street address, and sends the entered PIN to that lookup service.
+- The Trigger Email extension sends email from the `mail` collection. Deploy the included Firestore rules after installing it. Emails are queued when an order is placed and when the seller moves it to Confirmed or Delivered; test SMTP delivery from the extension before going live.
 
 ## How the main flows work
 

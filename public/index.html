@@ -274,11 +274,12 @@ th{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
 .ftr .wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:24px}
 .ftr h4{color:#fff;margin-bottom:8px;font-family:var(--font-display)}
 .ftr button{display:block;background:none;border:0;color:inherit;padding:4px 0;text-align:left}
+.ftr a{display:block;color:inherit;padding:4px 0}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style>
 <div id="app">
   <header id="hdr">
-    <div class="ann"><div class="wrap">Cute stationery, bookish finds and crafty things · Free delivery above ₹499 · Code WELCOME10 on your first order</div></div>
+    <div class="ann"><div class="wrap">Cute stationery, bookish finds and crafty things · Free delivery on qualifying orders · Code WELCOME10 on your first order</div></div>
     <div class="mode" id="mode" hidden></div>
     <div class="top"><div class="wrap topin">
       <button class="brand-b" data-act="home" aria-label="Haat Bazaar home"><span class="mark">H</span><span>Haat <b>Bazaar</b></span></button>
@@ -414,11 +415,13 @@ function seedCoupons(){return[
 ]}
 
 /* ---------- state ---------- */
-const SHIP_FREE_MIN=499, SHIP_FEE=49;
+const DEFAULT_STORE_SETTINGS={shippingFee:49,freeShippingMinimum:499,contactEmail:'',contactPhone:''};
+const RETURN_WINDOW_MS=7*24*60*60*1000;
 const FLOW=['Placed','Confirmed','Packed','Shipped','Delivered'];
+const RETURN_FLOW=['Return accepted','Return processed','Refund initiated'];
 const S={
   view:'shop',params:{},cat:'all',q:'',sort:'rel',price:'',minRating:0,
-  products:[],coupons:[],orders:[],me:null,ownerUid:null,reviews:{},loaded:{products:false},
+  products:[],coupons:[],orders:[],me:null,ownerUid:null,reviews:{},settings:Object.assign({},DEFAULT_STORE_SETTINGS),loaded:{products:false},
   cart:store.get('haat.cart',[]),wish:store.get('haat.wish',[]),
   couponCode:store.get('haat.coupon',''),couponInput:'',couponMsg:'',
   sel:{size:'',color:'',qty:1,img:0,rate:0},co:{step:1,addr:null,adding:false},
@@ -448,7 +451,9 @@ function couponCheck(c,sub,u){
 function totals(lines,coupon,u){
   const sub=lines.reduce((s,l)=>s+price(l.p)*l.qty,0);
   const mrp=lines.reduce((s,l)=>s+l.p.mrp*l.qty,0);
-  let shipping=(!sub||sub>=SHIP_FREE_MIN)?0:SHIP_FEE,off=0,res=null;
+  const minimum=Number(S.settings.freeShippingMinimum)||0;
+  const allProductsFree=lines.length>0&&lines.every(l=>l.p.freeDelivery===true);
+  let shipping=(!sub||(minimum>0&&sub>=minimum)||allProductsFree)?0:(Number(S.settings.shippingFee)||0),off=0,res=null;
   if(coupon){res=couponCheck(coupon,sub,u);if(res.ok){off=res.off;if(res.ship)shipping=0}}
   return{sub,mrp,off,shipping,total:Math.max(0,sub-off)+shipping,saved:(mrp-sub)+off,res};
 }
@@ -456,6 +461,46 @@ const activeCoupon=()=>S.couponCode?S.coupons.find(c=>c.code===S.couponCode):nul
 
 /* ---------- address checks (offline: format + PIN-to-state consistency) ---------- */
 const STATES=['Andaman & Nicobar Islands','Andhra Pradesh','Arunachal Pradesh','Assam','Bihar','Chandigarh','Chhattisgarh','Dadra & Nagar Haveli and Daman & Diu','Delhi','Goa','Gujarat','Haryana','Himachal Pradesh','Jammu & Kashmir','Jharkhand','Karnataka','Kerala','Ladakh','Lakshadweep','Madhya Pradesh','Maharashtra','Manipur','Meghalaya','Mizoram','Nagaland','Odisha','Puducherry','Punjab','Rajasthan','Sikkim','Tamil Nadu','Telangana','Tripura','Uttar Pradesh','Uttarakhand','West Bengal'];
+const PIN_LOCATIONS={};
+const PIN_REQUESTS={};
+function normalizeState(state){
+  const aliases={Orissa:'Odisha',Pondicherry:'Puducherry',Uttaranchal:'Uttarakhand','Jammu and Kashmir':'Jammu & Kashmir','NCT of Delhi':'Delhi','Dadra and Nagar Haveli':'Dadra & Nagar Haveli and Daman & Diu','Daman and Diu':'Dadra & Nagar Haveli and Daman & Diu'};
+  return aliases[state]||state;
+}
+async function lookupPin(pin){
+  if(!/^\d{6}$/.test(pin))throw new Error('Enter a 6-digit PIN code');
+  if(PIN_LOCATIONS[pin])return PIN_LOCATIONS[pin];
+  if(PIN_REQUESTS[pin])return PIN_REQUESTS[pin];
+  PIN_REQUESTS[pin]=(async()=>{
+    const response=await fetch('https://api.postalpincode.in/pincode/'+encodeURIComponent(pin));
+    if(!response.ok)throw new Error('PIN lookup is unavailable right now. Try again in a moment.');
+    const result=await response.json();
+    const record=Array.isArray(result)?result[0]:null;
+    if(!record||record.Status!=='Success'||!Array.isArray(record.PostOffice))return [];
+    return record.PostOffice.filter(p=>p&&p.Name&&p.District&&p.State).map(p=>({
+      name:String(p.Name).trim(),district:String(p.District).trim(),state:normalizeState(String(p.State).trim())
+    }));
+  })();
+  try{PIN_LOCATIONS[pin]=await PIN_REQUESTS[pin];return PIN_LOCATIONS[pin]}
+  finally{delete PIN_REQUESTS[pin]}
+}
+async function showPinLocations(pin,form){
+  const hint=form.querySelector('#pin-h'),select=form.querySelector('#pin-office');
+  if(!hint||!select)return;
+  select.innerHTML='<option value="">Loading matching post offices…</option>';
+  select.disabled=true;select.hidden=false;
+  try{
+    const locations=await lookupPin(pin);
+    if(form.elements.pin.value!==pin)return;
+    PIN_LOCATIONS[pin]=locations;
+    if(!locations.length){hint.textContent='No matching India Post offices found for this PIN code.';select.innerHTML='<option value="">No post offices found</option>';return}
+    select.innerHTML='<option value="">Select your post office / locality</option>'+locations.map((p,i)=>'<option value="'+i+'">'+esc(p.name+' · '+p.district+', '+p.state)+'</option>').join('');
+    select.disabled=false;
+    hint.textContent='Select your post office to fill district and state.';
+  }catch(e){
+    if(form.elements.pin.value===pin)hint.textContent=e.message||'Could not look up this PIN code. Try again.';
+  }
+}
 function pinStates(pin){
   const p3=+pin.slice(0,3),p2=+pin.slice(0,2);
   if(p3===403)return['Goa'];
@@ -510,10 +555,12 @@ function verifyAddress(v){
   const junk=/(test|asdf|qwer|xxxx|abcd|dummy|fake)/i;
   add(/^[\p{L} .'-]{2,60}$/u.test(nm)&&!junk.test(nm),'Name','Looks good','Use the recipient’s real name, letters only');
   add(/^[6-9]\d{9}$/.test(ph)&&!/^(\d)\1{9}$/.test(ph),'Mobile number','10-digit Indian mobile','Enter a valid 10-digit mobile starting with 6, 7, 8 or 9');
-  const pi=pinInfo(pin);
-  add(pi.ok,'PIN code','Valid India Post range',pi.msg||'');
-  if(pi.ok)add(pi.states.includes(v.state),'PIN and state match','PIN '+pin+' belongs to '+v.state,'PIN '+pin+' belongs to '+pi.states.join(' / ')+', not '+(v.state||'the state you chose'));
-  else add(false,'PIN and state match','','Fix the PIN code first');
+  const validPin=/^\d{6}$/.test(pin)&&pin[0]!=='0'&&pin[0]!=='9';
+  add(validPin,'PIN code','6-digit India Post PIN format','Enter a valid 6-digit PIN code');
+  const locations=PIN_LOCATIONS[pin]||[],officeIndex=String(v.postOffice||''),selected=officeIndex===''?null:locations[Number(officeIndex)];
+  add(!!selected,'PIN locality',selected?'Matches '+selected.name+', '+selected.district:'Select a matching India Post office from the PIN lookup results');
+  add(!!selected&&selected.state===v.state,'PIN and state match',selected?'PIN '+pin+' belongs to '+selected.state:'Select a matching post office and state','Select a matching post office and state');
+  if(selected)add(v.city===selected.district,'District','Matches '+selected.district,'Use the district returned for this PIN code');
   add(/^[\p{L} .'-]{2,40}$/u.test(city)&&!junk.test(city),'City / town','Looks good','Enter your city or town, letters only');
   add(house.length>=8&&/\p{L}/u.test(house)&&!/(.)\1{4,}/.test(house)&&!junk.test(house),'House and street','Looks complete','Enter flat or house number, building and street (at least 8 characters)');
   return{ok:out.every(x=>x.ok),checks:out};
@@ -542,9 +589,15 @@ function buildChrome(){
   $('#qbtn').innerHTML=IC.search;$('#h-ai').innerHTML=IC.user;$('#h-wi').innerHTML=IC.heart;$('#h-ci').innerHTML=IC.cart;
   $('#rail').innerHTML='<button class="cat" data-act="cat" data-id="all"><img alt="" src="'+artURI({shape:'notebook',a:'#7460B6',b:'#F1A7BC',c:'#fff',bg:'#EEE8FA'},0)+'">All</button>'+
     CATS.map(c=>'<button class="cat" data-act="cat" data-id="'+c.id+'"><img alt="" src="'+catIcon(c)+'">'+esc(c.name)+'</button>').join('');
-  $('#ftr').innerHTML='<div class="wrap"><div><h4>Haat Bazaar</h4><p>Bookmarks, books, cute notebooks and creative supplies, with free delivery above '+inr(SHIP_FREE_MIN)+'.</p></div>'+
+  buildFooter();
+}
+function buildFooter(){
+  $('#ftr').innerHTML='<div class="wrap"><div><h4>Haat Bazaar</h4><p>Bookmarks, books, cute notebooks and creative supplies.</p><button data-act="policy">Shipping & returns policy</button></div>'+
     '<div><h4>Shop</h4>'+CATS.slice(0,5).map(c=>'<button data-act="cat" data-id="'+c.id+'">'+esc(c.name)+'</button>').join('')+'</div>'+
-    '<div><h4>Orders</h4><p>Cash on delivery on every order. Ask to cancel any order before it ships from My account.</p></div></div>';
+    '<div><h4>Orders</h4><p>Cash on delivery on every order. Ask to cancel before an order ships from My account.</p></div>'+
+    '<div><h4>Contact</h4><button data-act="contact">Contact the seller</button>'+
+    (S.settings.contactEmail?'<a href="mailto:'+encodeURIComponent(S.settings.contactEmail)+'">'+esc(S.settings.contactEmail)+'</a>':'')+
+    (S.settings.contactPhone?'<a href="https://wa.me/'+esc(S.settings.contactPhone.replace(/\D/g,''))+'" target="_blank" rel="noopener">WhatsApp '+esc(S.settings.contactPhone)+'</a>':'')+'</div></div>';
 }
 function refreshHeader(){
   const u=user();
@@ -553,6 +606,7 @@ function refreshHeader(){
   const wc=S.wish.length,cc=S.cart.reduce((s,i)=>s+i.qty,0);
   $('#h-wc').textContent=wc;$('#h-wc').hidden=!wc;$('#h-cc').textContent=cc;$('#h-cc').hidden=!cc;
   $$('#rail .cat').forEach(b=>b.classList.toggle('on',S.view==='shop'&&b.dataset.id===S.cat));
+  buildFooter();
 }
 
 /* ---------- shop view ---------- */
@@ -609,7 +663,7 @@ function card(p){
     '<button class="wish'+(w?' on':'')+'" data-act="wish" data-id="'+p.id+'" aria-pressed="'+w+'" aria-label="'+(w?'Remove from':'Add to')+' wishlist">'+IC.heart+'</button>'+(out?'<span class="oos">Out of stock</span>':'')+'</div>'+
     '<div class="cb"><h3 class="pn"><button class="lk" data-act="open" data-id="'+p.id+'">'+esc(p.name)+'</button></h3>'+
     '<div class="pr"><b>'+inr(price(p))+'</b><s>'+inr(p.mrp)+'</s><span class="off">'+disc(p)+'% off</span></div>'+
-    '<div class="meta">'+rpill(p)+(price(p)>=SHIP_FREE_MIN?'<span>Free delivery</span>':'')+'</div>'+
+    '<div class="meta">'+rpill(p)+((p.freeDelivery||(Number(S.settings.freeShippingMinimum)>0&&price(p)>=Number(S.settings.freeShippingMinimum)))?'<span>Free delivery available</span>':'')+'</div>'+
     (p.stock>0&&p.stock<=5?'<p class="low">Only '+p.stock+' left</p>':'')+
     '<button class="btn pri sm" data-act="quick" data-id="'+p.id+'"'+(out?' disabled':'')+'>'+(needsOpts(p)?'Select options':'Add to cart')+'</button></div></article>';
 }
@@ -638,7 +692,20 @@ function reviewCard(r){
   return '<div class="rev"><div class="av">'+esc((r.user||'?').charAt(0).toUpperCase())+'</div><div class="stack" style="gap:4px"><div class="row"><b>'+esc(r.user)+'</b>'+(r.sample?'<span class="pill warn">Sample review</span>':'')+(verified?'<span class="pill good">Verified purchase</span>':'')+'</div>'+stars(r.rating)+'<p>'+esc(r.text)+'</p><p class="hint">'+fmtDate(r.at)+'</p></div></div>';
 }
 function rvHTML(p){const l=S.reviews[p.id];if(!l)return '<p class="muted">Loading reviews…</p>';return l.length?'<div>'+l.map(reviewCard).join('')+'</div>':'<p class="muted">No written reviews yet. Be the first.</p>'}
-function shareText(p){return p.name+'\n'+inr(price(p))+' (MRP '+inr(p.mrp)+', '+disc(p)+'% off)\nCash on delivery. Free delivery above '+inr(SHIP_FREE_MIN)+'.\nOrder here: '+location.href.split('#')[0]+'#p-'+p.id}
+function deliveredOrdersFor(pid){
+  const u=user();
+  return u?S.orders.filter(o=>o.uid===u.uid&&(o.status==='Delivered'||o.status==='Return'||RETURN_FLOW.includes(o.status))&&o.items.some(i=>i.pid===pid)).sort((a,b)=>b.at-a.at):[];
+}
+function reviewForm(p){
+  const u=user(),orders=deliveredOrdersFor(p.id),reviews=S.reviews[p.id]||[];
+  if(!u)return '<p class="hint">Sign in to the account that placed the order to review after delivery.</p>';
+  if(!orders.length)return '<p class="hint">Reviews are available after this product has been delivered to you.</p>';
+  if(reviews.some(r=>r.uid===u.uid))return '<p class="hint">Thanks for sharing your review.</p>';
+  return '<form class="stack" data-form="review"><span class="lbl">Rate this delivered product</span><div class="rate" id="rate" role="radiogroup" aria-label="Your rating">'+[1,2,3,4,5].map(n=>'<button type="button" data-act="setrate" data-n="'+n+'" role="radio" aria-checked="false" aria-label="'+n+' star'+(n>1?'s':'')+'">★</button>').join('')+'</div>'+
+    '<div class="field"><label for="rv-text">Your review</label><textarea class="in" id="rv-text" name="text" placeholder="What did you like about the design, paper or quality?"></textarea></div><p class="ferr" id="rv-err"></p><button class="btn brand" style="width:fit-content">Submit review</button></form>';
+}
+const timestampMs=t=>t&&typeof t.toMillis==='function'?t.toMillis():Number(t)||0;
+function shareText(p){const minimum=Number(S.settings.freeShippingMinimum)||0;return p.name+'\n'+inr(price(p))+' (MRP '+inr(p.mrp)+', '+disc(p)+'% off)\nCash on delivery. '+(p.freeDelivery?'Free delivery on this item.':minimum?'Free delivery on orders above '+inr(minimum)+'.':'Delivery '+inr(S.settings.shippingFee)+' per order.')+'\nOrder here: '+location.href.split('#')[0]+'#p-'+p.id}
 VIEWS.product=()=>{
   const p=byId(S.params.id);
   if(!p&&!S.loaded.products)return empty('Loading…','');
@@ -652,7 +719,7 @@ VIEWS.product=()=>{
   '<div class="stack"><div><h1 class="h1" style="font-size:clamp(22px,3vw,30px)">'+esc(p.name)+'</h1>'+(p.sample?'<p class="hint" style="margin-top:6px">Sample product with sample ratings</p>':'')+'</div>'+
   '<div class="row">'+rpill(p)+'<span class="muted">'+(p.rated.n?p.rated.n.toLocaleString('en-IN')+' ratings':'No ratings yet')+'</span></div>'+
   '<div class="pr"><span class="big">'+inr(price(p))+'</span><s>'+inr(p.mrp)+'</s><span class="off">'+disc(p)+'% off</span></div>'+
-  '<div class="tags"><span class="pill good">'+(price(p)>=SHIP_FREE_MIN?'Free delivery':'Free delivery over '+inr(SHIP_FREE_MIN))+'</span><span class="pill">Cash on delivery</span><span class="pill">7-day returns</span></div>'+
+  '<div class="tags"><span class="pill good">'+(p.freeDelivery||(Number(S.settings.freeShippingMinimum)>0&&price(p)>=Number(S.settings.freeShippingMinimum))?'Free delivery available':(Number(S.settings.freeShippingMinimum)>0?'Free delivery over '+inr(S.settings.freeShippingMinimum):'Delivery '+inr(S.settings.shippingFee)+' per order'))+'</span><span class="pill">Cash on delivery</span><span class="pill">7-day return requests after delivery</span></div>'+
   (own?'<p class="own">Owner view: cost '+inr(p.cost)+' + margin '+inr(p.margin)+' ('+Math.round(p.margin/price(p)*100)+'% of price). Stock '+p.stock+'.</p>':'')+
   (p.sizes.length?'<div class="field"><span class="lbl">'+(p.sizes.length>1?'Select size / option':'Size')+'</span><div class="chips">'+chips('size',p.sizes)+'</div></div>':'')+
   (p.colors.length?'<div class="field"><span class="lbl">'+(p.colors.length>1?'Select colour':'Colour')+'</span><div class="chips">'+chips('color',p.colors)+'</div></div>':'')+
@@ -662,9 +729,7 @@ VIEWS.product=()=>{
   '<div class="panel stack" style="gap:10px"><span class="lbl">Share with your customers</span><div class="row"><a class="btn ghost sm" target="_blank" rel="noopener" href="https://wa.me/?text='+encodeURIComponent(shareText(p))+'">'+IC.wa+' WhatsApp</a><button class="btn ghost sm" data-act="sharecopy" data-id="'+p.id+'">Copy product text</button></div></div></div></div>'+
   '<section class="sec panel stack"><h2 class="h2">Product details</h2><p>'+esc(p.desc)+'</p><dl class="dl">'+Object.keys(p.details||{}).map(k=>'<dt>'+esc(k)+'</dt><dd>'+esc(p.details[k])+'</dd>').join('')+'</dl></section>'+
   '<section class="sec panel stack"><div class="row sp"><h2 class="h2">Ratings and reviews</h2><div class="row">'+(p.rated.n?'<span class="big" style="font-size:26px">'+ratingOf(p).toFixed(1)+'</span>'+stars(ratingOf(p)):'')+'</div></div>'+
-  rvHTML(p)+
-  '<form class="stack" data-form="review"><span class="lbl">Rate this product</span><div class="rate" id="rate" role="radiogroup" aria-label="Your rating">'+[1,2,3,4,5].map(n=>'<button type="button" data-act="setrate" data-n="'+n+'" role="radio" aria-checked="false" aria-label="'+n+' star'+(n>1?'s':'')+'">★</button>').join('')+'</div>'+
-  '<div class="field"><label for="rv-text">Your review</label><textarea class="in" id="rv-text" name="text" placeholder="What did you like about the design, paper or quality?"></textarea></div><p class="ferr" id="rv-err"></p><button class="btn brand" style="width:fit-content">Submit review</button></form></section>'+
+  rvHTML(p)+reviewForm(p)+'</section>'+
   (similar.length?'<section class="sec"><h2 class="h2" style="margin-bottom:12px">You may also like</h2><div class="grid">'+similar.map(card).join('')+'</div></section>':'');
 };
 
@@ -702,7 +767,7 @@ function addrForm(u){
   return '<form class="panel stack" id="af" data-form="addr" data-inp="afdirty" novalidate><h3 class="h3">Add delivery address</h3><div class="fg">'+
     '<div class="field"><label for="af-name">Full name</label><input class="in" id="af-name" name="name" autocomplete="name" value="'+esc(u.name)+'"></div>'+
     '<div class="field"><label for="af-phone">Mobile number</label><input class="in" id="af-phone" name="phone" inputmode="numeric" maxlength="10" autocomplete="tel-national" value="'+esc(u.phone||'')+'"></div>'+
-    '<div class="field"><label for="af-pin">PIN code</label><input class="in" id="af-pin" name="pin" inputmode="numeric" maxlength="6" autocomplete="postal-code" data-inp="pinhint"><span class="hint" id="pin-h"></span></div>'+
+    '<div class="field"><label for="af-pin">PIN code</label><input class="in" id="af-pin" name="pin" inputmode="numeric" maxlength="6" autocomplete="postal-code" data-inp="pinhint"><span class="hint" id="pin-h"></span><select class="in" id="pin-office" name="postOffice" hidden disabled><option value="">Enter a PIN code to look up post offices</option></select></div>'+
     '<div class="field"><label for="af-state">State</label><select class="in" id="af-state" name="state"><option value="">Select state</option>'+STATES.map(s=>'<option>'+esc(s)+'</option>').join('')+'</select></div>'+
     '<div class="field"><label for="af-city">City / town</label><input class="in" id="af-city" name="city" autocomplete="address-level2"></div>'+
     '<div class="field"><label for="af-type">Address type</label><select class="in" id="af-type" name="type"><option>Home</option><option>Work</option><option>Other</option></select></div></div>'+
@@ -711,11 +776,11 @@ function addrForm(u){
     '<div class="field"><label for="af-land">Landmark (optional)</label><input class="in" id="af-land" name="landmark"></div>'+
     '<div id="av-res" aria-live="polite"></div><div class="row"><button type="button" class="btn brand" data-act="verifyaddr">Verify address</button><button class="btn pri" id="av-save" hidden>Save and deliver here</button>'+
     (u.addresses.length?'<button type="button" class="btn ghost" data-act="canceladd">Cancel</button>':'')+'</div>'+
-    '<p class="hint">Checks name, mobile, PIN code range, PIN-to-state match and address completeness. The courier confirms the final delivery point.</p></form>';
+    '<p class="hint">Checks your name and mobile, then confirms the PIN, selected post office, district and state against the postal directory. Enter your full street address too; a PIN lookup cannot identify a house or street.</p></form>';
 }
 function addrCard(a,sel){
   return '<div class="row" style="align-items:stretch;flex-wrap:nowrap"><button class="acard" data-act="pickaddr" data-id="'+a.id+'" aria-pressed="'+sel+'"><span class="radio"></span><span class="stack" style="gap:4px"><span class="row"><b>'+esc(a.name)+'</b><span class="pill">'+esc(a.type)+'</span><span class="pill good">Verified</span></span>'+
-    '<span>'+esc(a.house)+(a.area?', '+esc(a.area):'')+(a.landmark?' (near '+esc(a.landmark)+')':'')+'</span><span>'+esc(a.city)+', '+esc(a.state)+' '+esc(a.pin)+'</span><span class="muted">Mobile '+esc(a.phone)+'</span></span></button>'+
+    '<span>'+esc(a.house)+(a.area?', '+esc(a.area):'')+(a.landmark?' (near '+esc(a.landmark)+')':'')+'</span><span>'+esc(a.postOffice?a.postOffice+', ':'')+esc(a.city)+', '+esc(a.state)+' '+esc(a.pin)+'</span><span class="muted">Mobile '+esc(a.phone)+'</span></span></button>'+
     '<button class="tb bad" data-act="deladdr" data-id="'+a.id+'" aria-label="Delete address">Delete</button></div>';
 }
 VIEWS.checkout=()=>{
@@ -733,8 +798,8 @@ VIEWS.checkout=()=>{
       '<button class="btn pri" data-act="costep" data-n="2"'+(addr&&!co.adding?'':' disabled')+' style="width:fit-content">Review order</button></div>';
   }else{
     body='<div class="stack"><div class="panel stack"><h3 class="h3">Items</h3>'+lines.map(l=>'<div class="oi"><img src="'+thumb(l.p)+'" alt=""><div style="flex:1;min-width:0"><b>'+esc(l.p.name)+'</b><p class="muted">'+[l.size,l.color].filter(Boolean).map(esc).join(' · ')+' · Qty '+l.qty+'</p></div><b>'+inr(price(l.p)*l.qty)+'</b></div>').join('')+'</div>'+
-      '<div class="panel stack" style="gap:6px"><div class="row sp"><h3 class="h3">Deliver to</h3><button class="tb" data-act="costep" data-n="1">Change</button></div><p><b>'+esc(addr.name)+'</b>, '+esc(addr.phone)+'</p><p>'+esc(addr.house)+(addr.area?', '+esc(addr.area):'')+', '+esc(addr.city)+', '+esc(addr.state)+' '+esc(addr.pin)+'</p><p class="hint">Estimated delivery in '+(pinInfo(addr.pin).days||'4 to 7')+' days</p></div>'+
-      '<div class="panel stack" style="gap:6px"><h3 class="h3">Payment</h3><p><b>Cash on delivery</b></p><p class="hint">Pay '+inr(t.total)+' in cash to the courier when your order arrives. No extra fee.</p></div>'+
+      '<div class="panel stack" style="gap:6px"><div class="row sp"><h3 class="h3">Deliver to</h3><button class="tb" data-act="costep" data-n="1">Change</button></div><p><b>'+esc(addr.name)+'</b>, '+esc(addr.phone)+'</p><p>'+esc(addr.house)+(addr.area?', '+esc(addr.area):'')+', '+esc(addr.postOffice?addr.postOffice+', ':'')+esc(addr.city)+', '+esc(addr.state)+' '+esc(addr.pin)+'</p><p class="hint">Estimated delivery in '+(pinInfo(addr.pin).days||'4 to 7')+' days</p></div>'+
+      '<div class="panel stack" style="gap:6px"><h3 class="h3">Payment</h3><p><b>Cash on delivery</b></p><p class="hint">Pay '+inr(t.total)+' in cash to the courier when your order arrives. Delivery charge: '+(t.shipping?inr(t.shipping):'Free')+'.</p></div>'+
       '<div class="row"><button class="btn ghost" data-act="costep" data-n="1">Back</button><button class="btn pri" data-act="place" style="flex:1 1 200px">Place order · '+inr(t.total)+'</button></div></div>';
   }
   return '<h1 class="h1">Checkout</h1><div class="stepper sec"><span class="'+st(1)+'">1 Address</span><span class="'+st(2)+'">2 Review and place order</span></div>'+
@@ -742,20 +807,32 @@ VIEWS.checkout=()=>{
 };
 function timeline(o){
   if(o.status==='Cancelled')return '<p><span class="pill bad">Cancelled</span></p>';
-  const i=FLOW.indexOf(o.status);
-  return '<ol class="tl" aria-label="Order progress">'+FLOW.map((s,k)=>'<li class="'+(k<=i?'done':'')+'"><span class="dot"></span><span>'+s+'</span></li>').join('')+'</ol>';
+  const milestones=o.returnRequested||o.status==='Return'||RETURN_FLOW.includes(o.status)?FLOW.concat(RETURN_FLOW):FLOW;
+  const current=o.status==='Return'?'Return accepted':o.status;
+  const i=milestones.indexOf(current);
+  return '<ol class="tl" aria-label="Order progress">'+milestones.map((s,k)=>'<li class="'+(k<=i?'done':'')+'"><span class="dot"></span><span>'+s+'</span></li>').join('')+'</ol>';
 }
 const priceDiff=o=>o.items.some(i=>{const p=byId(i.pid);return p&&price(p)!==i.price});
 function orderCard(o,seller){
   const canCancel=!seller&&!o.cancelRequested&&(o.status==='Placed'||o.status==='Confirmed');
+  const canReturn=!seller&&o.status==='Delivered'&&!o.returnRequested&&timestampMs(o.deliveredAt)>0&&Date.now()-timestampMs(o.deliveredAt)<RETURN_WINDOW_MS;
+  const returnIndex=o.status==='Return'?0:RETURN_FLOW.indexOf(o.status);
+  const returnOptions=o.status==='Return'?RETURN_FLOW.slice(1):RETURN_FLOW.slice(0,Math.max(1,returnIndex+2));
+  const statusOptions=FLOW.concat(o.returnRequested||o.status==='Return'||returnIndex>=0?returnOptions:[],['Cancelled']);
+  const legacyReturnOption=o.status==='Return'?'<option value="Return" selected>Return accepted</option>':'';
   return '<article class="order"><div class="oh"><div><b>Order '+esc(o.id)+'</b><p class="hint">'+fmtDate(o.at)+(seller?' · '+esc(o.name)+' · '+esc(o.email):'')+'</p></div><div class="row"><span class="pill '+(o.paid?'good':'warn')+'">'+(o.paid?'Paid in cash':'Pay on delivery')+'</span><b>'+inr(o.total)+'</b></div></div>'+
     '<div class="ob">'+timeline(o)+o.items.map(i=>{const p=byId(i.pid);return '<div class="oi"><img src="'+(p?thumb(p):artURI({shape:'notebook',a:'#7460B6',b:'#F1A7BC',c:'#fff',bg:'#EEE8FA'},0))+'" alt=""><div style="flex:1;min-width:0"><b>'+esc(i.name)+'</b><p class="muted">'+[i.size,i.color].filter(Boolean).map(esc).join(' · ')+' · Qty '+i.qty+'</p></div><span>'+inr(i.price*i.qty)+'</span></div>'}).join('')+
-    '<p class="hint">Deliver to '+esc(o.addr.name)+', '+esc(o.addr.house)+', '+esc(o.addr.city)+', '+esc(o.addr.state)+' '+esc(o.addr.pin)+' · Mobile '+esc(o.addr.phone)+'</p>'+
-    (seller?'<div class="row"><label class="lbl" for="os-'+o.id+'">Status</label><select class="sel" id="os-'+o.id+'" data-chg="ostatus" data-id="'+o.id+'"'+(o.status==='Cancelled'?' disabled':'')+'>'+FLOW.concat(['Cancelled']).map(s=>opt(s,s,o.status)).join('')+'</select>'+
+    '<p class="hint">Deliver to '+esc(o.addr.name)+', '+esc(o.addr.house)+', '+esc(o.addr.postOffice?o.addr.postOffice+', ':'')+esc(o.addr.city)+', '+esc(o.addr.state)+' '+esc(o.addr.pin)+' · Mobile '+esc(o.addr.phone)+'</p>'+
+    (seller?'<div class="row"><label class="lbl" for="os-'+o.id+'">Status</label><select class="sel" id="os-'+o.id+'" data-chg="ostatus" data-id="'+o.id+'"'+(o.status==='Cancelled'?' disabled':'')+'>'+statusOptions.map(s=>opt(s,s,o.status)).join('')+legacyReturnOption+'</select>'+
+      (o.status==='Delivered'&&!timestampMs(o.deliveredAt)?'<button class="btn ghost sm" data-act="recorddelivery" data-id="'+o.id+'">Record delivery date</button>':'')+
       (o.cancelRequested&&o.status!=='Cancelled'?'<span class="pill warn">Customer asked to cancel</span><button class="btn ghost sm" data-act="ownercancel" data-id="'+o.id+'">Cancel and restock</button>':'')+
+      (o.returnRequested?'<span class="pill warn">Customer requested a return</span>':'')+
       (priceDiff(o)?'<span class="pill warn" title="An item price differs from the current catalogue price">Price check</span>':'')+
       '<span class="hint">Profit on this order: <b>'+inr(o.profit)+'</b></span></div>':'')+
+    (!seller&&o.status==='Delivered'&&!timestampMs(o.deliveredAt)&&!o.returnRequested?'<p class="hint">The seller needs to record the delivery date before a return request can be made.</p>':'')+
     (canCancel?'<div><button class="btn ghost sm" data-act="cancelorder" data-id="'+o.id+'">Ask to cancel</button></div>':'')+
+    (canReturn?'<div><button class="btn ghost sm" data-act="returnorder" data-id="'+o.id+'">Request a return</button><p class="hint">Available within 7 days of delivery.</p></div>':'')+
+    (!seller&&o.returnRequested?'<p class="pill warn" style="width:fit-content">Your return request was sent to the seller.</p>':'')+
     (!seller&&o.cancelRequested&&o.status!=='Cancelled'?'<p class="pill warn" style="width:fit-content">Cancellation requested. The seller will confirm.</p>':'')+'</div></article>';
 }
 VIEWS.success=()=>{
@@ -792,6 +869,7 @@ function productForm(){
     '<div class="field"><label for="pf-margin">Your margin (₹)</label><input class="in" id="pf-margin" name="margin" inputmode="decimal" data-inp="pfcalc" value="'+esc(v.margin)+'"></div>'+
     '<div class="field"><label for="pf-mrp">MRP (₹)</label><input class="in" id="pf-mrp" name="mrp" inputmode="decimal" data-inp="pfcalc" value="'+esc(v.mrp)+'"></div>'+
     '<div class="field"><label for="pf-stock">Stock</label><input class="in" id="pf-stock" name="stock" inputmode="numeric" value="'+esc(v.stock)+'"></div></div>'+
+    '<label class="row"><input type="checkbox" name="freeDelivery"'+(v.freeDelivery?' checked':'')+'> This product qualifies for free delivery</label>'+
     '<p class="own" id="pf-calc" aria-live="polite"></p>'+
     '<div class="fg"><div class="field"><label for="pf-sizes">Sizes / options (comma separated)</label><input class="in" id="pf-sizes" name="sizes" value="'+esc(v.sizes.join(', '))+'" placeholder="A5, 120 pages, Set of 3"></div>'+
     '<div class="field"><label for="pf-colors">Colours (comma separated)</label><input class="in" id="pf-colors" name="colors" value="'+esc(v.colors.join(', '))+'" placeholder="Pink, Lilac"></div></div>'+
@@ -800,6 +878,16 @@ function productForm(){
     '<div class="field"><label for="pf-files">Product photos (up to 4)</label><input class="in" id="pf-files" type="file" accept="image/*" multiple data-chg="pfiles" style="padding-top:9px"></div><div class="prev" id="pf-prev">'+formPrev()+'</div>'+
     '<div class="field"><label for="pf-shape">Placeholder illustration</label><select class="in" id="pf-shape" name="shape">'+Object.keys(SHAPE_NAMES).map(k=>opt(k,SHAPE_NAMES[k],(v.art&&v.art.shape)||'notebook')).join('')+'</select></div>'+
     '<p class="ferr" id="pf-err"></p><div class="row"><button class="btn pri">'+(p?'Save changes':'Add product')+'</button><button type="button" class="btn ghost" data-act="cancelp">Cancel</button></div></form>';
+}
+function storeSettingsForm(){
+  const s=S.settings;
+  return '<form class="panel stack sec" data-form="storesettings"><h3 class="h3">Delivery and contact settings</h3><div class="fg">'+
+    '<div class="field"><label for="sf-fee">Delivery charge per order (₹)</label><input class="in" id="sf-fee" name="shippingFee" type="number" min="0" max="2000" step="1" value="'+esc(s.shippingFee)+'"></div>'+
+    '<div class="field"><label for="sf-min">Free delivery minimum (₹, 0 disables)</label><input class="in" id="sf-min" name="freeShippingMinimum" type="number" min="0" max="100000" step="1" value="'+esc(s.freeShippingMinimum)+'"></div>'+
+    '<div class="field"><label for="sf-email">Customer support email</label><input class="in" id="sf-email" name="contactEmail" type="email" maxlength="120" value="'+esc(s.contactEmail)+'"></div>'+
+    '<div class="field"><label for="sf-phone">WhatsApp number (include country code)</label><input class="in" id="sf-phone" name="contactPhone" type="tel" maxlength="20" value="'+esc(s.contactPhone)+'" placeholder="+91 9876543210"></div></div>'+
+    '<p class="hint">The order delivery charge is waived when the cart reaches the free-delivery minimum, or when every product in it is marked Free delivery. An active free-shipping coupon also waives it.</p>'+
+    '<p class="ferr" aria-live="polite"></p><button class="btn brand" style="width:fit-content">Save settings</button></form>';
 }
 function couponForm(){
   return '<form class="panel stack" data-form="newcoupon" novalidate><h3 class="h3">New coupon</h3><div class="fg">'+
@@ -826,7 +914,7 @@ VIEWS.seller=()=>{
       '<div class="panel stack sec"><h3 class="h3">Store data</h3><p class="muted">'+(DB.mode==='firebase'?'Connected to Firebase project <b>'+esc(firebaseConfig.projectId||'')+'</b>. Products and orders are saved in Firestore. Existing products are not changed automatically; update or remove your old catalogue here.':'Demo mode: data is saved in this browser only. Add your Firebase config to go live.')+'</p><div class="row">'+
       (S.products.length===0?'<button class="btn brand" data-act="loadsample">Load sample products</button>':'')+
       (S.products.some(p=>p.sample)?'<button class="btn ghost" data-act="rmsample">Remove sample products</button>':'')+
-      (DB.mode==='local'?'<button class="btn ghost" data-act="resetstore">'+(S.delArm==='reset'?'Click again to erase everything':'Clear demo data')+'</button>':'')+'</div></div>';
+      (DB.mode==='local'?'<button class="btn ghost" data-act="resetstore">'+(S.delArm==='reset'?'Click again to erase everything':'Clear demo data')+'</button>':'')+'</div></div>'+storeSettingsForm();
   }else if(S.stab==='products'){
     body=(S.editing?productForm():'<div class="row sp"><h3 class="h3">'+S.products.length+' products</h3><button class="btn pri" data-act="newp">+ Add product</button></div>')+
       '<div class="panel sec tw"><table><thead><tr><th></th><th>Product</th><th>Cost</th><th>Margin</th><th>Price</th><th>Stock</th><th></th></tr></thead><tbody>'+
@@ -860,7 +948,7 @@ function errText(e){
 function makeLocal(){
   const D={mode:'local'};let cb=null,watch=null;
   const rd=(k,d)=>store.get('haat.'+k,d),wr=(k,v)=>store.set('haat.'+k,v);
-  let products=rd('products',null),coupons=rd('coupons',null),users=rd('users',[]),orders=rd('orders',[]),reviews=rd('reviews',{});
+  let products=rd('products',null),coupons=rd('coupons',null),users=rd('users',[]),orders=rd('orders',[]),reviews=rd('reviews',{}),storeSettings=Object.assign({},DEFAULT_STORE_SETTINGS,rd('storeSettings',{}));
   if(!products){products=seedProducts();wr('products',products)}
   if(!coupons){coupons=seedCoupons();wr('coupons',coupons)}
   const pub=u=>u?{uid:u.uid,email:u.email,name:u.name,phone:u.phone,addresses:u.addresses||[]}:null;
@@ -868,7 +956,7 @@ function makeLocal(){
   const ownerUid=()=>(claimOwnerOnFirstSignup&&users.length)?users[0].uid:null;
   const ordersFor=()=>{const m=meNow();if(!m)return[];return m.uid===ownerUid()?orders.slice():orders.filter(o=>o.uid===m.uid)};
   const pushP=()=>cb.products(clean(products)),pushC=()=>cb.coupons(clean(coupons)),pushO=()=>{if(watch)watch(clean(ordersFor()))};
-  D.start=c=>{cb=c;pushP();pushC();cb.owner(ownerUid());cb.me(meNow())};
+  D.start=c=>{cb=c;pushP();pushC();cb.owner(ownerUid());cb.settings(storeSettings);cb.me(meNow())};
   D.watchOrders=(me,owner,fn)=>{watch=fn;fn(clean(ordersFor()))};
   D.signUp=async(name,email,phone,pw)=>{
     if(users.some(u=>u.email===email))throw {code:'auth/email-already-in-use'};
@@ -885,6 +973,7 @@ function makeLocal(){
   };
   D.signOut=async()=>{wr('session',null)};
   D.saveProfile=async(uid,patch)=>{const u=users.find(x=>x.uid===uid);if(!u)return;Object.assign(u,clean(patch));wr('users',users)};
+  D.saveStoreSettings=async settings=>{storeSettings=Object.assign({},DEFAULT_STORE_SETTINGS,clean(settings));if(!wr('storeSettings',storeSettings))throw new Error('Browser storage is full; store settings could not be saved.');cb.settings(storeSettings)};
   D.saveProduct=async p=>{const i=products.findIndex(x=>x.id===p.id);if(i>=0)products[i]=clean(p);else products.unshift(clean(p));if(!wr('products',products))throw new Error('Browser storage is full. Use fewer or smaller photos.');pushP()};
   D.deleteProducts=async ids=>{products=products.filter(p=>!ids.includes(p.id));wr('products',products);pushP()};
   D.seed=async()=>{products=seedProducts();if(!coupons.length)coupons=seedCoupons();wr('products',products);wr('coupons',coupons);pushP();pushC()};
@@ -899,21 +988,29 @@ function makeLocal(){
   D.setStatus=async(o,status)=>{
     const c=orders.find(x=>x.id===o.id);if(!c||c.status==='Cancelled')return;
     if(status==='Cancelled')c.items.forEach(i=>{const p=products.find(x=>x.id===i.pid);if(p)p.stock+=i.qty});
-    c.status=status;if(status==='Delivered')c.paid=true;if(status==='Cancelled')c.cancelRequested=false;
+    c.status=status;if(status==='Delivered'){c.paid=true;if(!c.deliveredAt)c.deliveredAt=Date.now()}if(status==='Cancelled')c.cancelRequested=false;
     wr('orders',orders);wr('products',products);pushP();pushO();
   };
   D.requestCancel=async id=>{const c=orders.find(x=>x.id===id);if(c){c.cancelRequested=true;wr('orders',orders);pushO()}};
+  D.requestReturn=async id=>{
+    const c=orders.find(x=>x.id===id);
+    if(!c||c.status!=='Delivered'||!c.deliveredAt||Date.now()-c.deliveredAt>=RETURN_WINDOW_MS)throw new Error('The 7-day return request window has ended.');
+    if(c.returnRequested)throw new Error('A return request has already been sent.');
+    c.returnRequested=true;c.returnRequestedAt=Date.now();wr('orders',orders);pushO();
+  };
   D.loadReviews=async pid=>(reviews[pid]||[]).slice().sort((a,b)=>b.at-a.at);
   D.addReview=async(pid,rev)=>{
     const l=reviews[pid]||(reviews[pid]=[]);
     if(l.some(r=>r.uid===rev.uid))throw {code:'reviewed'};
+    const order=orders.find(o=>o.id===rev.orderId&&o.uid===rev.uid&&(o.status==='Delivered'||o.status==='Return'||RETURN_FLOW.includes(o.status))&&o.items.some(i=>JSON.stringify(i)===JSON.stringify(rev.orderItem)&&i.pid===pid));
+    if(!order)throw new Error('Reviews are available after this product has been delivered.');
     l.push(clean(rev));const p=products.find(x=>x.id===pid);if(p){p.rated.sum+=rev.rating;p.rated.n+=1}
     wr('reviews',reviews);wr('products',products);pushP();
   };
   D.resetAll=async()=>{
-    products=seedProducts();coupons=seedCoupons();users=[];orders=[];reviews={};
-    wr('products',products);wr('coupons',coupons);wr('users',users);wr('orders',orders);wr('reviews',reviews);wr('session',null);
-    cb.me(null);cb.owner(null);pushP();pushC();pushO();
+    products=seedProducts();coupons=seedCoupons();users=[];orders=[];reviews={};storeSettings=Object.assign({},DEFAULT_STORE_SETTINGS);
+    wr('products',products);wr('coupons',coupons);wr('users',users);wr('orders',orders);wr('reviews',reviews);wr('session',null);wr('storeSettings',storeSettings);
+    cb.me(null);cb.owner(null);cb.settings(storeSettings);pushP();pushC();pushO();
   };
   return D;
 }
@@ -922,14 +1019,18 @@ async function makeFirebase(){
   const B='https://www.gstatic.com/firebasejs/10.14.1/';
   const [A,Au,F]=await Promise.all([import(B+'firebase-app.js'),import(B+'firebase-auth.js'),import(B+'firebase-firestore.js')]);
   const app=A.initializeApp(firebaseConfig),auth=Au.getAuth(app),fs=F.getFirestore(app);
-  const {collection,doc,getDoc,getDocs,setDoc,updateDoc,deleteDoc,onSnapshot,query,where,runTransaction,writeBatch}=F;
+  const {collection,doc,getDoc,getDocs,setDoc,updateDoc,deleteDoc,onSnapshot,query,where,runTransaction,writeBatch,serverTimestamp}=F;
   const D={mode:'firebase'};let onErr=()=>{},ounsub=null;
   const toMe=(u,d)=>({uid:u.uid,email:u.email,name:(d&&d.name)||u.email,phone:(d&&d.phone)||'',addresses:(d&&d.addresses)||[]});
   D.start=cb=>{
     onErr=cb.error;
     onSnapshot(collection(fs,'products'),s=>cb.products(s.docs.map(d=>d.data())),cb.error);
     onSnapshot(collection(fs,'coupons'),s=>cb.coupons(s.docs.map(d=>d.data())),cb.error);
-    onSnapshot(doc(fs,'config','store'),s=>cb.owner(s.exists()?s.data().ownerUid:null),cb.error);
+    onSnapshot(doc(fs,'config','store'),s=>{
+      const data=s.exists()?s.data():{};
+      cb.owner(data.ownerUid||null);
+      cb.settings(Object.assign({},DEFAULT_STORE_SETTINGS,data));
+    },cb.error);
     let un=null;
     Au.onAuthStateChanged(auth,u=>{
       if(un){un();un=null}
@@ -956,6 +1057,7 @@ async function makeFirebase(){
   };
   D.signOut=()=>Au.signOut(auth);
   D.saveProfile=(uid,patch)=>setDoc(doc(fs,'users',uid),clean(patch),{merge:true});
+  D.saveStoreSettings=settings=>setDoc(doc(fs,'config','store'),clean(settings),{merge:true});
   D.saveProduct=p=>setDoc(doc(fs,'products',String(p.id)),clean(p));
   D.deleteProducts=async ids=>{const b=writeBatch(fs);ids.forEach(id=>b.delete(doc(fs,'products',String(id))));await b.commit()};
   D.seed=async()=>{
@@ -973,6 +1075,10 @@ async function makeFirebase(){
       snaps.forEach((s,k)=>{const d=s.exists()?s.data():null;if(!d)throw new Error('gone|'+ids[k]);if(d.stock<need[ids[k]])throw new Error('stock|'+d.name+'|'+d.stock)});
       snaps.forEach((s,k)=>tx.update(refs[k],{stock:s.data().stock-need[ids[k]]}));
       tx.set(doc(fs,'orders',o.id),clean(o));
+      tx.set(doc(fs,'mail',o.id+'-placed'),{
+        to:o.email,orderId:o.id,event:'placed',at:Date.now(),
+        message:{subject:'Order '+o.id+' received',text:'Hi '+o.name+', your order '+o.id+' has been placed. Total: '+inr(o.total)+'.'}
+      });
     });
   };
   D.setStatus=async(o,status)=>{
@@ -982,17 +1088,27 @@ async function makeFirebase(){
       const back={};if(status==='Cancelled')cur.items.forEach(i=>{back[i.pid]=(back[i.pid]||0)+i.qty});
       const ids=Object.keys(back),ps=await Promise.all(ids.map(id=>tx.get(doc(fs,'products',id))));
       ps.forEach((s,k)=>{if(s.exists())tx.update(s.ref,{stock:s.data().stock+back[ids[k]]})});
-      const patch={status};if(status==='Delivered')patch.paid=true;if(status==='Cancelled')patch.cancelRequested=false;
+      const patch={status};if(status==='Delivered'){patch.paid=true;if(!cur.deliveredAt)patch.deliveredAt=serverTimestamp()}if(status==='Cancelled')patch.cancelRequested=false;
       tx.update(oref,patch);
+      if(cur.status!==status&&(status==='Confirmed'||status==='Delivered')){
+        const at=Date.now(),event=status.toLowerCase();
+        tx.set(doc(fs,'mail',o.id+'-'+event+'-'+at),{
+          to:cur.email,orderId:o.id,event,at,
+          message:{subject:'Order '+o.id+' '+event,text:'Hi '+cur.name+', your order '+o.id+' is now '+event+'.'}
+        });
+      }
     });
   };
   D.requestCancel=id=>updateDoc(doc(fs,'orders',id),{cancelRequested:true});
+  D.requestReturn=id=>updateDoc(doc(fs,'orders',id),{returnRequested:true,returnRequestedAt:serverTimestamp()});
   D.loadReviews=async pid=>{const s=await getDocs(collection(fs,'products',String(pid),'reviews'));return s.docs.map(d=>d.data()).sort((a,b)=>b.at-a.at)};
   D.addReview=async(pid,rev)=>{
     await runTransaction(fs,async tx=>{
       const pref=doc(fs,'products',String(pid)),rref=doc(fs,'products',String(pid),'reviews',rev.uid);
-      const [ps,rs]=await Promise.all([tx.get(pref),tx.get(rref)]);
+      const oref=doc(fs,'orders',String(rev.orderId));
+      const [ps,rs,os]=await Promise.all([tx.get(pref),tx.get(rref),tx.get(oref)]);
       if(rs.exists())throw {code:'reviewed'};
+      if(!os.exists()||os.data().uid!==rev.uid||os.data().status!=='Delivered'||!os.data().items.some(i=>JSON.stringify(i)===JSON.stringify(rev.orderItem)&&i.pid===pid))throw new Error('Reviews are available after this product has been delivered.');
       const r=(ps.data().rated)||{sum:0,n:0};
       tx.set(rref,clean(rev));tx.update(pref,{rated:{sum:r.sum+rev.rating,n:r.n+1}});
     });
@@ -1078,7 +1194,7 @@ async function placeOrder(){
   const addr=u.addresses.find(a=>a.id===S.co.addr);
   if(!addr||!addr.verified){toast('Choose a verified delivery address');return}
   const t=totals(lines,activeCoupon(),u),off=t.res&&t.res.ok?t.off:0;
-  const items=lines.map(l=>({pid:l.pid,name:l.p.name,size:l.size,color:l.color,qty:l.qty,price:price(l.p),cost:l.p.cost,mrp:l.p.mrp}));
+  const items=lines.map(l=>({pid:l.pid,name:l.p.name,size:l.size,color:l.color,qty:l.qty,price:price(l.p),cost:l.p.cost,mrp:l.p.mrp,freeDelivery:l.p.freeDelivery===true}));
   const o={id:'HB'+String(Date.now()).slice(-8),uid:u.uid,email:u.email,name:addr.name,at:Date.now(),items,addr:clean(addr),pay:'cod',
     coupon:off?S.couponCode:'',sub:t.sub,off,shipping:t.shipping,total:t.total,
     profit:items.reduce((s,i)=>s+(i.price-i.cost)*i.qty,0)-off,status:'Placed',paid:false,cancelRequested:false};
@@ -1116,8 +1232,11 @@ const num=s=>{const n=parseFloat(String(s).replace(/,/g,''));return isFinite(n)?
 const ownerOnly=()=>{if(!isOwner()){toast('Only the store owner can do that');return false}return true};
 async function changeStatus(o,status){
   if(!ownerOnly()||!o)return;
+  const currentReturnIndex=o.status==='Return'?0:RETURN_FLOW.indexOf(o.status);
+  const nextReturnIndex=RETURN_FLOW.indexOf(status);
+  if(nextReturnIndex>=0&&(!o.returnRequested||nextReturnIndex!==currentReturnIndex+1||(currentReturnIndex<0&&o.status!=='Delivered'))){toast('Return stages must be advanced in order after the customer requests a return.');render();return}
   try{await DB.setStatus(o,status)}catch(e){toast(errText(e));render();return}
-  o.status=status;if(status==='Delivered')o.paid=true;if(status==='Cancelled')o.cancelRequested=false;
+  o.status=status;if(status==='Delivered'){o.paid=true;if(!o.deliveredAt)o.deliveredAt=Date.now()}if(status==='Cancelled')o.cancelRequested=false;
   render();toast('Order '+o.id+' is now '+status);
 }
 
@@ -1139,10 +1258,16 @@ const acts={
   qty(el){const p=byId(S.params.id);S.sel.qty=Math.max(1,Math.min(Math.min(p.stock,10),S.sel.qty+(+el.dataset.d)));$('#qty').textContent=S.sel.qty},
   add(){const p=byId(S.params.id);const e=selErr(p);if(e){toast(e);return}addLine(p.id,S.sel.size,S.sel.color,S.sel.qty);toast('Added to cart','View cart',()=>go('cart'))},
   buynow(){const p=byId(S.params.id);const e=selErr(p);if(e){toast(e);return}addLine(p.id,S.sel.size,S.sel.color,S.sel.qty);startCheckout()},
-  pincheck(){
-    const v=$('#pin-in').value.trim(),r=pinInfo(v),el=$('#pin-res');
-    el.style.color=r.ok?'var(--good)':'var(--bad)';
-    el.textContent=r.ok?'Delivery to '+v+' ('+r.states[0]+') in '+r.days+' days. Cash on delivery available.':r.msg;
+  async pincheck(){
+    const v=$('#pin-in').value.trim(),el=$('#pin-res'),r=pinInfo(v);
+    el.style.color=/^\d{6}$/.test(v)&&v[0]!=='0'&&v[0]!=='9'?'var(--good)':'var(--bad)';
+    if(!/^\d{6}$/.test(v)||v[0]==='0'||v[0]==='9'){el.textContent='Enter a valid 6-digit PIN code';return}
+    el.textContent='Looking up post offices…';
+    try{
+      const places=await lookupPin(v);
+      el.style.color=places.length?'var(--good)':'var(--bad)';
+      el.textContent=places.length?'Delivery available in '+places.slice(0,4).map(p=>p.name+', '+p.district+', '+p.state).join(' · ')+(places.length>4?' · and '+(places.length-4)+' more localities':'')+'. Estimated '+(r.days||'4 to 7')+' days.':'No matching post offices found for this PIN code.';
+    }catch(e){el.style.color='var(--bad)';el.textContent=e.message||'Could not look up this PIN code.'}
   },
   sharecopy(el){copyText(shareText(byId(+el.dataset.id)),'Product text copied')},
   copycode(el){copyText(el.dataset.code,'Copied '+el.dataset.code)},
@@ -1150,6 +1275,12 @@ const acts={
   hdot(el){heroGo(+el.dataset.i);startHero()},hprev(){heroGo(S.heroI-1);startHero()},hnext(){heroGo(S.heroI+1);startHero()},
   cart(){go('cart')},wishlist(){go('wishlist')},
   account(){if(user())go('account');else openAuth('signin',()=>go('account'))},
+  policy(){openModal('<button class="x" data-act="closemodal" aria-label="Close">×</button><h2 class="h2">Shipping and returns policy</h2><div class="stack sec"><p>Delivery charge: '+inr(S.settings.shippingFee)+' per order unless free delivery applies.</p><p>'+(Number(S.settings.freeShippingMinimum)>0?'Free delivery applies to orders of '+inr(S.settings.freeShippingMinimum)+' or more. ':'The order-value free-delivery threshold is disabled. ')+'Free delivery also applies when every item in the cart is marked for free delivery. An eligible free-shipping coupon also waives the charge.</p><p>Return requests must be submitted within 7 days after the order is marked delivered. Open My account → Orders and choose Request a return. The seller will contact you about next steps.</p><p>Orders are currently cash on delivery.</p></div>')},
+  contact(){
+    const links=(S.settings.contactEmail?'<p><a href="mailto:'+encodeURIComponent(S.settings.contactEmail)+'">'+esc(S.settings.contactEmail)+'</a></p>':'')+
+      (S.settings.contactPhone?'<p><a href="https://wa.me/'+esc(S.settings.contactPhone.replace(/\D/g,''))+'" target="_blank" rel="noopener">WhatsApp '+esc(S.settings.contactPhone)+'</a></p>':'');
+    openModal('<button class="x" data-act="closemodal" aria-label="Close">×</button><h2 class="h2">Contact</h2><div class="stack sec">'+(links||'<p>Customer contact details have not been added yet.</p>')+'</div>');
+  },
   signin(){openAuth('signin')},signup(){openAuth('signup')},closemodal(){closeModal()},
   tab(el){S.tab=el.dataset.t;render()},
   async logout(){try{await DB.signOut()}catch(e){}S.me=null;okey='';syncOrders();toast('Signed out');go('shop')},
@@ -1176,7 +1307,20 @@ const acts={
     try{await DB.requestCancel(o.id)}catch(e){toast(errText(e));return}
     o.cancelRequested=true;render();toast('Cancellation requested. The seller will confirm.');
   },
+  async returnorder(el){
+    const o=S.orders.find(x=>x.id===el.dataset.id);
+    if(!o||o.status!=='Delivered'||Date.now()-timestampMs(o.deliveredAt)>=RETURN_WINDOW_MS){toast('The 7-day return request window has ended.');return}
+    try{await DB.requestReturn(o.id)}catch(e){toast(errText(e));return}
+    o.returnRequested=true;o.returnRequestedAt=Date.now();render();toast('Return request sent to the seller.');
+  },
   ownercancel(el){changeStatus(S.orders.find(x=>x.id===el.dataset.id),'Cancelled')},
+  async recorddelivery(el){
+    if(!ownerOnly())return;
+    const o=S.orders.find(x=>x.id===el.dataset.id);
+    if(!o||o.status!=='Delivered'||timestampMs(o.deliveredAt))return;
+    try{await DB.setStatus(o,'Delivered')}catch(e){toast(errText(e));render();return}
+    o.deliveredAt=Date.now();render();toast('Delivery date recorded. The customer can request a return within 7 days.');
+  },
   newp(){if(!ownerOnly())return;S.editing='new';S.formImgs=[];render()},
   editp(el){if(!ownerOnly())return;const p=byId(+el.dataset.id);S.editing=p.id;S.formImgs=(p.imgs||[]).slice();render();const f=$('#pf-name');if(f&&f.scrollIntoView)f.scrollIntoView()},
   cancelp(){S.editing=null;render()},
@@ -1219,7 +1363,7 @@ function applyCoupon(code){
 }
 function runVerify(){
   const f=$('#af');if(!f)return false;
-  const v={name:val(f,'name'),phone:val(f,'phone'),pin:val(f,'pin'),state:val(f,'state'),city:val(f,'city'),house:val(f,'house')};
+  const v={name:val(f,'name'),phone:val(f,'phone'),pin:val(f,'pin'),postOffice:val(f,'postOffice'),state:val(f,'state'),city:val(f,'city'),house:val(f,'house')};
   const r=verifyAddress(v);
   $('#av-res').innerHTML='<ul class="checks">'+r.checks.map(c=>'<li><span class="'+(c.ok?'ok':'no')+'" aria-hidden="true">'+(c.ok?'✓':'✗')+'</span><span><b>'+esc(c.label)+':</b> '+esc(c.msg)+'</span></li>').join('')+'</ul>';
   $('#av-save').hidden=!r.ok;
@@ -1259,11 +1403,12 @@ const subs={
   async review(f){
     const u=user(),p=byId(S.params.id),err=$('#rv-err');
     if(!u){openAuth('signin',()=>render());return}
+    const delivered=deliveredOrdersFor(p.id)[0],orderItem=delivered&&delivered.items.find(i=>i.pid===p.id);
+    if(!delivered||!orderItem){err.textContent='Reviews are available after this product has been delivered.';return}
     if(!S.sel.rate){err.textContent='Tap a star rating first';return}
     const text=val(f,'text');if(text.length<5){err.textContent='Write a few words about the product';return}
     if(text.length>600){err.textContent='Keep the review under 600 characters';return}
-    const rev={uid:u.uid,user:u.name,rating:S.sel.rate,text,at:Date.now(),
-      verified:S.orders.some(o=>o.uid===u.uid&&o.status!=='Cancelled'&&o.items.some(i=>i.pid===p.id))};
+    const rev={uid:u.uid,user:u.name,rating:S.sel.rate,text,at:Date.now(),orderId:delivered.id,orderItem,verified:true};
     busy(f,true);
     try{await DB.addReview(p.id,rev)}catch(e){busy(f,false);err.textContent=errText(e);return}
     S.reviews[p.id]=[rev].concat(S.reviews[p.id]||[]);S.sel.rate=0;
@@ -1272,7 +1417,7 @@ const subs={
   },
   async addr(f){
     if(!runVerify())return;
-    const u=user(),a={id:'a'+Date.now(),name:val(f,'name'),phone:val(f,'phone'),pin:val(f,'pin'),state:val(f,'state'),city:val(f,'city'),house:val(f,'house'),area:val(f,'area'),landmark:val(f,'landmark'),type:val(f,'type')||'Home',verified:true,at:Date.now()};
+    const u=user(),a={id:'a'+Date.now(),name:val(f,'name'),phone:val(f,'phone'),pin:val(f,'pin'),postOffice:(PIN_LOCATIONS[val(f,'pin')]||[])[Number(val(f,'postOffice'))].name,state:val(f,'state'),city:val(f,'city'),house:val(f,'house'),area:val(f,'area'),landmark:val(f,'landmark'),type:val(f,'type')||'Home',verified:true,at:Date.now()};
     const next=u.addresses.concat([a]);
     try{await DB.saveProfile(u.uid,{addresses:next})}catch(e){toast(errText(e));return}
     u.addresses=next;S.co.addr=a.id;S.co.adding=false;render();toast('Address verified and saved');
@@ -1291,7 +1436,7 @@ const subs={
     val(f,'details').split('\n').forEach(l=>{const i=l.indexOf(':');if(i>0&&l.slice(i+1).trim())details[l.slice(0,i).trim()]=l.slice(i+1).trim()});
     const cat=CATS.find(c=>c.id===val(f,'cat'))||CATS[0],shape=val(f,'shape')||'notebook';
     const art={shape,a:cat.a,b:cat.b,c:'#FFFFFF',bg:cat.bg,bg2:'#EDE7FF'};
-    const data={name,cat:cat.id,cost,margin,mrp,stock,sizes:list(val(f,'sizes')),colors:list(val(f,'colors')),desc:val(f,'desc')||name,details,imgs:S.formImgs.slice(),art};
+    const data={name,cat:cat.id,cost,margin,mrp,stock,freeDelivery:!!f.elements.freeDelivery.checked,sizes:list(val(f,'sizes')),colors:list(val(f,'colors')),desc:val(f,'desc')||name,details,imgs:S.formImgs.slice(),art};
     let prod;
     if(S.editing==='new')prod=Object.assign({id:S.products.reduce((m,p)=>Math.max(m,p.id),0)+1,rated:{sum:0,n:0},sample:false,at:Date.now()},data);
     else prod=Object.assign({},byId(S.editing),data);
@@ -1311,6 +1456,19 @@ const subs={
     const c={code,desc,type,value:type==='ship'?0:value,min,cap,first:!!f.elements.first.checked,active:true};
     try{await DB.saveCoupon(c)}catch(e){err.textContent=errText(e);return}
     S.coupons.push(c);render();toast(code+' added');
+  },
+  async storesettings(f){
+    if(!ownerOnly())return;
+    const err=f.querySelector('.ferr'),shippingFee=num(val(f,'shippingFee')),freeShippingMinimum=num(val(f,'freeShippingMinimum'));
+    const contactEmail=val(f,'contactEmail').toLowerCase(),contactPhone=val(f,'contactPhone');
+    if(!Number.isFinite(shippingFee)||shippingFee<0||shippingFee>2000)return void(err.textContent='Delivery charge must be between ₹0 and ₹2,000');
+    if(!Number.isFinite(freeShippingMinimum)||freeShippingMinimum<0||freeShippingMinimum>100000)return void(err.textContent='Free delivery minimum must be between ₹0 and ₹1,00,000');
+    if(contactEmail&&!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(contactEmail))return void(err.textContent='Enter a valid customer support email');
+    if(contactPhone&&!/^[+\d() .-]{7,20}$/.test(contactPhone))return void(err.textContent='Enter a valid contact number');
+    const settings={shippingFee,freeShippingMinimum,contactEmail,contactPhone};
+    busy(f,true);
+    try{await DB.saveStoreSettings(settings)}catch(e){busy(f,false);err.textContent=errText(e);return}
+    S.settings=Object.assign({},DEFAULT_STORE_SETTINGS,settings);refreshHeader();render();toast('Delivery and contact settings saved');
   }
 };
 
@@ -1322,6 +1480,14 @@ document.addEventListener('click',e=>{
 });
 document.addEventListener('submit',e=>{const f=e.target;if(f.dataset&&f.dataset.form&&subs[f.dataset.form]){e.preventDefault();subs[f.dataset.form](f)}});
 document.addEventListener('change',e=>{
+  const office=e.target.closest('#pin-office');
+  if(office){
+    const f=office.closest('#af'),places=PIN_LOCATIONS[f.elements.pin.value]||[],p=office.value===''?null:places[Number(office.value)];
+    if(p){f.elements.city.value=p.district;f.elements.state.value=p.state}
+    const save=$('#av-save');if(save)save.hidden=true;
+    const result=$('#av-res');if(result)result.innerHTML='';
+    return;
+  }
   const el=e.target.closest('[data-chg]');if(!el)return;
   const k=el.dataset.chg;
   if(k==='sort'){S.sort=el.value;render()}
@@ -1335,8 +1501,12 @@ document.addEventListener('input',e=>{
   if(t.id==='q'){clearTimeout(t._d);t._d=setTimeout(()=>{S.q=t.value.trim();S.cat='all';if(S.view!=='shop'){S.view='shop';S.params={}}render()},280);return}
   if(t.dataset&&t.dataset.inp==='pfcalc'){calcPreview();return}
   if(t.dataset&&t.dataset.inp==='pinhint'){
-    const v=t.value.replace(/\D/g,'');t.value=v;const h=$('#pin-h');
-    if(v.length===6){const r=pinInfo(v);h.textContent=r.ok?'Looks like '+r.states[0]:r.msg;if(r.ok){const s=$('#af-state');if(!s.value)s.value=r.states[0]}}else h.textContent='';
+    const v=t.value.replace(/\D/g,'');t.value=v;const h=$('#pin-h'),select=$('#pin-office');
+    if(select){select.hidden=true;select.disabled=true;select.innerHTML='<option value="">Enter a PIN code to look up post offices</option>'}
+    const office=$('#af-state'),city=$('#af-city'),area=$('#af-area');
+    if(office)office.value='';if(city)city.value='';if(area)area.value='';
+    if(v.length===6){h.textContent='Looking up matching post offices…';showPinLocations(v,t.closest('#af'))}
+    else h.textContent='';
   }
   const f=t.closest&&t.closest('#af');
   if(f){const s=$('#av-save');if(s)s.hidden=true;const r=$('#av-res');if(r)r.innerHTML=''}
@@ -1355,6 +1525,7 @@ const cbk={
   },
   coupons(l){S.coupons=l;softRender()},
   owner(uid){S.ownerUid=uid;syncOrders();softRender()},
+  settings(s){S.settings=Object.assign({},DEFAULT_STORE_SETTINGS,s);refreshHeader();softRender()},
   me(m){S.me=m;syncOrders();softRender()},
   error(e){console.error(e);if(Date.now()-lastErr>6000){lastErr=Date.now();toast(errText(e))}}
 };
